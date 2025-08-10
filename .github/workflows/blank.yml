@@ -1,0 +1,293 @@
+name: Clean WordPress Latest
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  clean-wordpress:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Latest WordPress Version
+        id: get_version
+        run: |
+          curl -s https://api.wordpress.org/core/version-check/1.7/ > version.json
+          LATEST=$(jq -r '.offers[0].current' version.json)
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          echo "WordPress version: $LATEST"
+
+      - name: Get Latest Bricks Builder Version
+        id: get_bricks_version
+        env:
+          BRICKS_LICENSE_KEY: ${{ secrets.BRICKS_LICENSE_KEY }}
+        run: |
+          if [ -n "$BRICKS_LICENSE_KEY" ]; then
+            echo "Checking Bricks Builder availability..."
+            # Since Bricks doesn't provide a version API, we'll use a hash-based approach
+            # Download just the headers to check if there's a new version available
+            if BRICKS_HEADERS=$(curl -s -I "https://my.bricksbuilder.io/api/commerce/download/get_theme?license_key=$BRICKS_LICENSE_KEY" 2>/dev/null); then
+              # Extract content-length or last-modified as version indicator
+              CONTENT_LENGTH=$(echo "$BRICKS_HEADERS" | grep -i content-length | awk '{print $2}' | tr -d '\r\n' || echo "unknown")
+              LAST_MODIFIED=$(echo "$BRICKS_HEADERS" | grep -i last-modified | cut -d' ' -f2- | tr -d '\r\n' || echo "unknown")
+              
+              # Create a SHA-256 hash from both values to detect changes
+              BRICKS_HASH=$(echo "${CONTENT_LENGTH}-${LAST_MODIFIED}" | sha256sum | cut -d' ' -f1)
+              
+              echo "bricks_version=$BRICKS_HASH" >> $GITHUB_OUTPUT
+              echo "bricks_available=true" >> $GITHUB_OUTPUT
+              echo "Bricks Builder SHA-256: $BRICKS_HASH"
+              echo "Content-Length: $CONTENT_LENGTH, Last-Modified: $LAST_MODIFIED"
+            else
+              echo "bricks_available=false" >> $GITHUB_OUTPUT
+              echo "Bricks Builder API not accessible"
+            fi
+          else
+            echo "bricks_available=false" >> $GITHUB_OUTPUT
+            echo "No Bricks license key provided"
+          fi
+
+      - name: Get Latest Elementor and Core Framework Versions  
+        id: get_elementor_version
+        run: |
+          echo "Checking Hello Elementor theme version..."
+          
+          # Get Hello Elementor theme version
+          if HELLO_API=$(curl -s "https://api.wordpress.org/themes/info/1.0/hello-elementor.json" 2>/dev/null) && echo "$HELLO_API" | jq . >/dev/null 2>&1; then
+            HELLO_VERSION=$(echo "$HELLO_API" | jq -r '.version')
+            echo "hello_elementor_version=$HELLO_VERSION" >> $GITHUB_OUTPUT
+            echo "Hello Elementor theme version: $HELLO_VERSION"
+          else
+            echo "hello_elementor_version=latest" >> $GITHUB_OUTPUT
+            echo "Hello Elementor: API failed, using latest"
+          fi
+          
+          echo "Checking Elementor plugin version..."
+          
+          # Get Elementor plugin version  
+          if ELEMENTOR_API=$(curl -s "https://api.wordpress.org/plugins/info/1.0/elementor.json" 2>/dev/null) && echo "$ELEMENTOR_API" | jq . >/dev/null 2>&1; then
+            ELEMENTOR_VERSION=$(echo "$ELEMENTOR_API" | jq -r '.version')
+            echo "elementor_plugin_version=$ELEMENTOR_VERSION" >> $GITHUB_OUTPUT
+            echo "Elementor plugin version: $ELEMENTOR_VERSION"
+          else
+            echo "elementor_plugin_version=latest" >> $GITHUB_OUTPUT  
+            echo "Elementor plugin: API failed, using latest"
+          fi
+          
+          echo "Checking Core Framework plugin version..."
+          
+          # Get Core Framework plugin version
+          if CORE_API=$(curl -s "https://api.wordpress.org/plugins/info/1.0/core-framework.json" 2>/dev/null) && echo "$CORE_API" | jq . >/dev/null 2>&1; then
+            CORE_VERSION=$(echo "$CORE_API" | jq -r '.version')
+            echo "core_framework_version=$CORE_VERSION" >> $GITHUB_OUTPUT
+            echo "Core Framework plugin version: $CORE_VERSION"
+          else
+            echo "core_framework_version=latest" >> $GITHUB_OUTPUT  
+            echo "Core Framework plugin: API failed, using latest"
+          fi
+
+      - name: Check for Existing Versions
+        id: check_existing
+        run: |
+          WP_VERSION="${{ steps.get_version.outputs.version }}"
+          BRICKS_VERSION="${{ steps.get_bricks_version.outputs.bricks_version }}"
+          HELLO_VERSION="${{ steps.get_elementor_version.outputs.hello_elementor_version }}"
+          ELEMENTOR_VERSION="${{ steps.get_elementor_version.outputs.elementor_plugin_version }}"
+          CORE_VERSION="${{ steps.get_elementor_version.outputs.core_framework_version }}"
+          
+          # Create version identifier combining all versions
+          COMBINED_VERSION="wp-${WP_VERSION}_bricks-${BRICKS_VERSION}_hello-${HELLO_VERSION}_elementor-${ELEMENTOR_VERSION}_core-${CORE_VERSION}"
+          
+          echo "Combined version check: $COMBINED_VERSION"
+          
+          if [ -f "VERSION.txt" ] && grep -q "$COMBINED_VERSION" VERSION.txt; then
+            echo "All components are up to date."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Updates found, proceeding with build..."
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "combined_version=$COMBINED_VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download WordPress
+        if: steps.check_existing.outputs.skip == 'false'
+        run: |
+          echo "Downloading WordPress ${{ steps.get_version.outputs.version }}"
+          curl -L -O https://wordpress.org/wordpress-${{ steps.get_version.outputs.version }}.zip
+          unzip -q wordpress-${{ steps.get_version.outputs.version }}.zip
+
+      - name: Clean WordPress
+        if: steps.check_existing.outputs.skip == 'false'
+        run: |
+          cd wordpress
+          echo "Removing unnecessary files..."
+          rm -f license.txt readme.html xmlrpc.php
+          rm -rf wp-content/themes/twenty*
+          rm -rf wp-content/plugins/akismet
+          rm -f wp-content/plugins/hello.php
+          cd ..
+          rm -rf cleaned
+          mv wordpress cleaned
+
+      - name: Modify wp-config-sample.php
+        if: steps.check_existing.outputs.skip == 'false'
+        run: |
+          echo "Adding custom configuration to wp-config-sample.php"
+          # Create a simple replacement using awk
+          awk '
+          /\/\* Add any custom values between this line and the "stop editing" line\. \*\// {
+            print "// Custom configuration added automatically"
+            print "define('\''AUTOMATIC_UPDATER_DISABLED'\'', true);"
+            print "define('\''WP_AUTO_UPDATE_CORE'\'', false);"
+            print "// Cron Disable"
+            print "define('\''DISABLE_WP_CRON'\'', true);"
+            print "// Limit the number of post revisions to 0"
+            print "define('\''WP_POST_REVISIONS'\'', false);"
+            print ""
+            print $0
+            next
+          }
+          { print }
+          ' cleaned/wp-config-sample.php > temp_config.php
+          mv temp_config.php cleaned/wp-config-sample.php
+
+      - name: Save Combined Version Number
+        if: steps.check_existing.outputs.skip == 'false'
+        run: |
+          echo "${{ steps.check_existing.outputs.combined_version }}" > VERSION.txt
+
+      - name: Create Versioned Folder and Zip
+        if: steps.check_existing.outputs.skip == 'false'
+        env:
+          BRICKS_LICENSE_KEY: ${{ secrets.BRICKS_LICENSE_KEY }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          
+          # Check if Bricks license key is available
+          if [ -z "$BRICKS_LICENSE_KEY" ]; then
+            echo "⚠️ BRICKS_LICENSE_KEY secret not set. Skipping Bricks Builder download."
+            SKIP_BRICKS=true
+          else
+            echo "✅ Bricks license key found"
+            SKIP_BRICKS=false
+          fi
+          
+          # Create version folders
+          mkdir -p "releases/wordpress-clean-$VERSION"
+          mkdir -p "releases/wordpress-bricks-$VERSION" 
+          mkdir -p "releases/wordpress-elementor-$VERSION"
+          
+          # 1. Clean WordPress version
+          echo "Creating clean WordPress version..."
+          cp -r cleaned/* "releases/wordpress-clean-$VERSION/"
+          
+          # 2. WordPress with Bricks Builder version
+          echo "Creating WordPress with Bricks Builder version..."
+          cp -r cleaned/* "releases/wordpress-bricks-$VERSION/"
+          
+          cd "releases/wordpress-bricks-$VERSION"
+          
+          # Download and setup Dixy child theme
+          echo "Adding Dixy child theme..."
+          curl -L -o dixy-child.zip https://github.com/DinuraSellapperuma/dixy-child/archive/refs/heads/main.zip
+          unzip -q dixy-child.zip
+          mv dixy-child-main wp-content/themes/dixy-child
+          rm dixy-child.zip
+          
+          # Get latest Bricks Builder version
+          if [ "${{ steps.get_bricks_version.outputs.bricks_available }}" = "true" ]; then
+            echo "Downloading Bricks Builder theme..."
+            BRICKS_API_URL="https://my.bricksbuilder.io/api/commerce/download/get_theme?license_key=$BRICKS_LICENSE_KEY"
+            
+            # Try to get latest version (fallback to 2.0.1 if API fails)
+            if curl -f -L -o bricks-theme.zip "$BRICKS_API_URL" 2>/dev/null; then
+              echo "Downloaded latest Bricks Builder theme"
+              unzip -q bricks-theme.zip -d wp-content/themes/
+              rm bricks-theme.zip
+            else
+              echo "Theme API failed, trying with version 2.0.1..."
+              curl -L -o bricks-theme.zip "$BRICKS_API_URL&version=2.0.1"
+              unzip -q bricks-theme.zip -d wp-content/themes/
+              rm bricks-theme.zip
+            fi
+            
+            echo "Downloading Core Framework plugin from WordPress.org..."
+            # Download Core Framework plugin from WordPress.org with version checking
+            CORE_VERSION="${{ steps.get_elementor_version.outputs.core_framework_version }}"
+            if [ "$CORE_VERSION" != "latest" ]; then
+              curl -L -o core-framework.zip "https://downloads.wordpress.org/plugin/core-framework.$CORE_VERSION.zip"
+            else
+              curl -L -o core-framework.zip "https://downloads.wordpress.org/plugin/core-framework.zip"
+            fi
+            unzip -q core-framework.zip -d wp-content/plugins/
+            rm core-framework.zip
+            echo "Downloaded Core Framework plugin version: $CORE_VERSION"
+          else
+            echo "⚠️ Skipping Bricks Builder download (not available)"
+          fi
+          
+          cd ../../
+          
+          # 3. WordPress with Elementor version
+          echo "Creating WordPress with Elementor version..."
+          cp -r cleaned/* "releases/wordpress-elementor-$VERSION/"
+          
+          cd "releases/wordpress-elementor-$VERSION"
+          
+          # Get latest Elementor versions using stored version info
+          echo "Downloading Hello Elementor theme..."
+          HELLO_VERSION="${{ steps.get_elementor_version.outputs.hello_elementor_version }}"
+          if [ "$HELLO_VERSION" != "latest" ]; then
+            curl -L -o hello-elementor.zip "https://downloads.wordpress.org/theme/hello-elementor.$HELLO_VERSION.zip"
+          else
+            curl -L -o hello-elementor.zip "https://downloads.wordpress.org/theme/hello-elementor.zip"
+          fi
+          unzip -q hello-elementor.zip -d wp-content/themes/
+          rm hello-elementor.zip
+          
+          echo "Downloading Elementor plugin..."
+          ELEMENTOR_VERSION="${{ steps.get_elementor_version.outputs.elementor_plugin_version }}"
+          if [ "$ELEMENTOR_VERSION" != "latest" ]; then
+            curl -L -o elementor.zip "https://downloads.wordpress.org/plugin/elementor.$ELEMENTOR_VERSION.zip"
+          else
+            curl -L -o elementor.zip "https://downloads.wordpress.org/plugin/elementor.zip"
+          fi
+          unzip -q elementor.zip -d wp-content/plugins/
+          rm elementor.zip
+          
+          cd ../../
+          
+          # Create zip files for all versions
+          cd releases
+          echo "Creating zip files..."
+          zip -r "wordpress-clean-$VERSION.zip" "wordpress-clean-$VERSION/"
+          zip -r "wordpress-bricks-$VERSION.zip" "wordpress-bricks-$VERSION/" 
+          zip -r "wordpress-elementor-$VERSION.zip" "wordpress-elementor-$VERSION/"
+          cd ..
+          
+          echo "Created WordPress packages:"
+          echo "- Clean: releases/wordpress-clean-$VERSION.zip"
+          echo "- Bricks: releases/wordpress-bricks-$VERSION.zip" 
+          echo "- Elementor: releases/wordpress-elementor-$VERSION.zip"
+
+      - name: Commit and Push Changes
+        if: steps.check_existing.outputs.skip == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Updated packages: WordPress ${{ steps.get_version.outputs.version }}, Bricks ${{ steps.get_bricks_version.outputs.bricks_version }}, Hello Elementor ${{ steps.get_elementor_version.outputs.hello_elementor_version }}, Elementor Plugin ${{ steps.get_elementor_version.outputs.elementor_plugin_version }}, Core Framework ${{ steps.get_elementor_version.outputs.core_framework_version }}"
+            git push
+          fi
